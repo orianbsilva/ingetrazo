@@ -59,6 +59,10 @@ _NO_INSTANCING = os.environ.get("INGETRAZO_NO_INSTANCING", "") == "1"
 # set to 1 to draw every paint on both sides like before — a diagnostic,
 # and the escape hatch should a driver misbehave with front culling.
 _NO_BACK_TINT = os.environ.get("INGETRAZO_NO_BACK_TINT", "") == "1"
+# Kill-switch for the cached surroundings of the faces pass: set to 1 to walk
+# every placement's chunk on every sync, as before (each frame of a Move
+# drag inside a group re-gathered them all).
+_NO_EDIT_FACE_CACHE = os.environ.get("INGETRAZO_NO_EDIT_FACE_CACHE", "") == "1"
 _perf_file = None
 
 
@@ -4950,7 +4954,113 @@ class Viewport(QOpenGLWidget):
         self._edit_split_db = None
         subject_bucketed = False
         pv_faces = getattr(self, "_preview_groups", None) or ()
-        for g in draw_groups:         # context first, edited group last
+
+        def _face_pass(groups):
+            """Every chunk contribution of ``groups``, in order, as a record
+            the caller merges — kept apart so the surroundings' record can
+            be cached on the placements epoch like the edges' head."""
+            rec = {"face_parts": [], "spans": [], "n": 0, "db_parts": [],
+                   "db_spans": [], "db_n": 0, "tex": [], "tcol": [],
+                   "ttex": [], "back_vcol": [], "back_tex": [],
+                   "back_tcol": [], "back_ttex": [], "fvcol": []}
+            for g in groups:
+                if (not self.scene.entity_visible(g)
+                        or getattr(g, "billboard", False)
+                        or id(g) in pv_faces
+                        or self._instanced_eligible(g)):
+                    continue
+                chunk = self._group_chunk(g)
+                if chunk.get("dback"):
+                    rec["db_parts"].append(chunk["dback"])
+                    rec["db_spans"].append((chunk.get("bbox"), rec["db_n"],
+                                            len(chunk["dback"]) // 12))
+                    rec["db_n"] += len(chunk["dback"]) // 12
+                rec["face_parts"].append(chunk["vcol"])
+                rec["spans"].append((chunk.get("bbox"), rec["n"],
+                                     len(chunk["vcol"]) // 24))
+                rec["n"] += len(chunk["vcol"]) // 24
+                # The SUBJECT of the edit, for the textured pass — which
+                # draws in its own runs and decides the fade with this flag,
+                # not with the positional split. Comparing by identity
+                # against `scene.edit_group` misses a nested group, because
+                # the draw list holds a proxy of it: Marco's whole plaza came
+                # out washed, the group he was editing included, because
+                # every textured face was marked as surroundings
+                # (2026-09-11).
+                subj = not self._draws_in_edit_context(g)
+                for path, raw in chunk["by_texture"].items():
+                    rec["tex"].append((path, raw, chunk.get("bbox"), subj))
+                rec["tcol"] += list(chunk.get("tcol", {}).items())
+                rec["ttex"] += list(chunk.get("ttex", {}).items())
+                if chunk.get("back_vcol"):
+                    rec["back_vcol"].append(chunk["back_vcol"])
+                rec["back_tex"] += list(chunk.get("back_tex", {}).items())
+                rec["back_tcol"] += list(chunk.get("back_tcol", {}).items())
+                rec["back_ttex"] += list(chunk.get("back_ttex", {}).items())
+                if chunk.get("fvcol"):
+                    rec["fvcol"].append(chunk["fvcol"])
+            return rec
+
+        def _merge(rec):
+            nonlocal gface_start, dback_start
+            face_parts.extend(rec["face_parts"])
+            group_face_spans.extend((bb, gface_start + st, n)
+                                    for bb, st, n in rec["spans"])
+            gface_start += rec["n"]
+            dback_parts.extend(rec["db_parts"])
+            dback_spans.extend((bb, dback_start + st, n)
+                               for bb, st, n in rec["db_spans"])
+            dback_start += rec["db_n"]
+            for path, raw, bb, subj in rec["tex"]:
+                group_texture.setdefault(path, []).append((raw, bb, subj))
+            for a, raw in rec["tcol"]:
+                tcol_runs.setdefault(a, []).append(raw)
+            for key, raw in rec["ttex"]:
+                ttex_runs.setdefault(key, []).append(raw)
+            back_vcol_parts.extend(rec["back_vcol"])
+            for key, raw in rec["back_tex"]:
+                back_tex_runs.setdefault(key, []).append(raw)
+            for key, raw in rec["back_tcol"]:
+                back_tcol_runs.setdefault(key, []).append(raw)
+            for key, raw in rec["back_ttex"]:
+                back_ttex_runs.setdefault(key, []).append(raw)
+            fcull_vcol_parts.extend(rec["fvcol"])
+
+        # The surroundings (everything but the open group) are keyed on the
+        # placements epoch, as the edges' head is above: every frame of a
+        # Move drag inside a group bumps the version, and walking every
+        # placement's chunk here for it cost ~25 ms a frame beside 576 small
+        # groups — for faces that had not changed. A push preview that hides
+        # faces (``suppressed_faces``) takes the walk, as before.
+        if editing:
+            face_head = [g for g in draw_groups
+                         if self._draws_in_edit_context(g)]
+            face_subject = [g for g in draw_groups
+                            if not self._draws_in_edit_context(g)]
+        else:
+            face_head, face_subject = draw_groups, []
+        head_rec = None
+        if not _NO_EDIT_FACE_CACHE and not suppressed_faces:
+            hcache = getattr(self, "_face_head_cache", None)
+            if hcache is not None and hcache[0] == gkey:
+                head_rec = hcache[1]
+            else:
+                head_rec = _face_pass(face_head)
+                self._face_head_cache = (gkey, head_rec)
+        if head_rec is not None:
+            _merge(head_rec)
+            if editing:
+                # Where the surroundings end: the subject comes next. Set
+                # here, before the subject's own skips — an instanced
+                # subject draws by another path, and the split must still
+                # be recorded for the context to fade (Marco, 2026-09-11,
+                # second level).
+                self._edit_split_f = gface_start   # made absolute below
+                self._edit_split_db = dback_start
+            walk = face_subject
+        else:
+            walk = draw_groups
+        for g in walk:                # context first, edited group last
             if (self._edit_split_f is None
                     and self.scene.edit_group is not None
                     and not self._draws_in_edit_context(g)):
@@ -4979,41 +5089,7 @@ class Viewport(QOpenGLWidget):
                 sink["dback"] = dback_loose
                 subject_bucketed = True
                 continue
-            chunk = self._group_chunk(g)
-            if chunk.get("dback"):
-                dback_parts.append(chunk["dback"])
-                dback_spans.append((chunk.get("bbox"), dback_start,
-                                    len(chunk["dback"]) // 12))
-                dback_start += len(chunk["dback"]) // 12
-            face_parts.append(chunk["vcol"])
-            group_face_spans.append((chunk.get("bbox"), gface_start,
-                                     len(chunk["vcol"]) // 24))
-            gface_start += len(chunk["vcol"]) // 24
-            # The SUBJECT of the edit, for the textured pass — which draws
-            # in its own runs and decides the fade with this flag, not with
-            # the positional split. Comparing by identity against
-            # `scene.edit_group` misses a nested group, because the draw list
-            # holds a proxy of it: Marco's whole plaza came out washed, the
-            # group he was editing included, because every textured face was
-            # marked as surroundings (2026-09-11).
-            subj = not self._draws_in_edit_context(g)
-            for path, raw in chunk["by_texture"].items():
-                group_texture.setdefault(path, []).append(
-                    (raw, chunk.get("bbox"), subj))
-            for a, raw in chunk.get("tcol", {}).items():
-                tcol_runs.setdefault(a, []).append(raw)
-            for key, raw in chunk.get("ttex", {}).items():
-                ttex_runs.setdefault(key, []).append(raw)
-            if chunk.get("back_vcol"):
-                back_vcol_parts.append(chunk["back_vcol"])
-            for key, raw in chunk.get("back_tex", {}).items():
-                back_tex_runs.setdefault(key, []).append(raw)
-            for key, raw in chunk.get("back_tcol", {}).items():
-                back_tcol_runs.setdefault(key, []).append(raw)
-            for key, raw in chunk.get("back_ttex", {}).items():
-                back_ttex_runs.setdefault(key, []).append(raw)
-            if chunk.get("fvcol"):
-                fcull_vcol_parts.append(chunk["fvcol"])
+            _merge(_face_pass([g]))
 
         # Kept as a part LIST (not one concatenated blob) so the upload can
         # tell which pieces changed; the trailing runs below append to it.
